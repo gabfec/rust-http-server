@@ -3,20 +3,55 @@ use std::net::TcpListener;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
+#[derive(Debug)]
+enum HttpMethod {
+    GET,
+    POST,
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: HttpMethod,
+    path: String,
+}
+
+impl HttpRequest {
+    fn from_stream(mut stream: &TcpStream) -> Option<Self> {
+        let mut buffer = [0; 1024];
+        let bytes_read = stream.read(&mut buffer).ok()?;
+
+        if bytes_read == 0 {
+            return None;
+        }
+
+        let request_str = String::from_utf8_lossy(&buffer);
+        let mut lines = request_str.lines();
+
+        // Parse the Request Line (e.g., "GET /index.html HTTP/1.1")
+        if let Some(first_line) = lines.next() {
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+            if parts.len() >= 2 {
+                let method = match parts[0] {
+                    "POST" => HttpMethod::POST,
+                    _ => HttpMethod::GET, // Default to GET for now
+                };
+
+                return Some(HttpRequest {
+                    method: method,
+                    path: parts[1].to_string(),
+                });
+            }
+        }
+        None
+    }
+}
+
 fn handle_connection(mut stream: TcpStream) {
-    let mut buffer = [0; 1024];
-    stream.read(&mut buffer).unwrap();
+    if let Some(request) = HttpRequest::from_stream(&stream) {
+        println!("Request received for path: {}", request.path);
 
-    let request_str = String::from_utf8_lossy(&buffer);
-    let lines: Vec<&str> = request_str.split("\r\n").collect();
-
-    if let Some(request_line) = lines.get(0) {
-        let parts: Vec<&str> = request_line.split_whitespace().collect();
-        let _method = parts[0];
-        let path = parts[1];
-
-        // Routing logic
-        match path {
+        match request.path.as_str() {
             "/" => stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap(),
             _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap(),
         }
