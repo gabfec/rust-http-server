@@ -1,7 +1,6 @@
-#[allow(unused_imports)]
-use std::net::TcpListener;
+use std::collections::HashMap;
+use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 #[derive(Debug)]
 enum HttpMethod {
@@ -13,11 +12,12 @@ enum HttpMethod {
 struct HttpRequest {
     method: HttpMethod,
     path: String,
+    headers: HashMap<String, String>,
 }
 
 impl HttpRequest {
     fn from_stream(mut stream: &TcpStream) -> Option<Self> {
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; 2048];
         let bytes_read = stream.read(&mut buffer).ok()?;
 
         if bytes_read == 0 {
@@ -27,23 +27,27 @@ impl HttpRequest {
         let request_str = String::from_utf8_lossy(&buffer);
         let mut lines = request_str.lines();
 
-        // Parse the Request Line (e.g., "GET /index.html HTTP/1.1")
-        if let Some(first_line) = lines.next() {
-            let parts: Vec<&str> = first_line.split_whitespace().collect();
+        // Parse Request Line
+        let first_line = lines.next()?;
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        let method = match parts.get(0)? {
+            &"POST" => HttpMethod::POST,
+            _ => HttpMethod::GET,
+        };
+        let path = parts.get(1)?.to_string();
 
-            if parts.len() >= 2 {
-                let method = match parts[0] {
-                    "POST" => HttpMethod::POST,
-                    _ => HttpMethod::GET, // Default to GET for now
-                };
-
-                return Some(HttpRequest {
-                    method: method,
-                    path: parts[1].to_string(),
-                });
+        // Parse Headers
+        let mut headers = HashMap::new();
+        for line in lines {
+            if line.is_empty() {
+                break; // End of headers
+            }
+            if let Some((key, value)) = line.split_once(": ") {
+                headers.insert(key.to_lowercase(), value.to_string());
             }
         }
-        None
+
+        Some(HttpRequest { method, path, headers })
     }
 }
 
@@ -60,6 +64,16 @@ fn handle_connection(mut stream: TcpStream) {
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
                     content.len(),
                     content
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            },
+            "/user-agent" => {
+                // Look up the header (keys are lowercase because we normalized them)
+                let ua = request.headers.get("user-agent").map(|s| s.as_str()).unwrap_or("");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    ua.len(),
+                    ua
                 );
                 stream.write_all(response.as_bytes()).unwrap();
             }
