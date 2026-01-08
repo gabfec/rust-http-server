@@ -53,6 +53,16 @@ fn handle_connection(mut stream: TcpStream) {
 
         match request.path.as_str() {
             "/" => stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap(),
+            // Fill the body of the response with the content of the path
+            path if path.starts_with("/echo/") => {
+                let content = &path[6..];
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    content.len(),
+                    content
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
             _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap(),
         }
     }
