@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
+use std::env;
+use std::fs;
 use std::thread;
+use std::path::Path;
 
 #[derive(Debug)]
 enum HttpMethod {
@@ -52,7 +55,7 @@ impl HttpRequest {
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(mut stream: TcpStream, directory: String) {
     if let Some(request) = HttpRequest::from_stream(&stream) {
         println!("Request received for path: {}", request.path);
 
@@ -68,6 +71,23 @@ fn handle_connection(mut stream: TcpStream) {
                 );
                 stream.write_all(response.as_bytes()).unwrap();
             },
+            path if path.starts_with("/files/") => {
+                let filename = &path[7..]; // Strip "/files/"
+                let file_path = Path::new(&directory).join(filename);
+
+                if file_path.exists() {
+                    let content = fs::read(&file_path).unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                        content.len()
+                    );
+                    // Send headers first, then the raw binary body
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(&content).unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+                }
+            }
             "/user-agent" => {
                 // Look up the header (keys are lowercase because we normalized them)
                 let ua = request.headers.get("user-agent").map(|s| s.as_str()).unwrap_or("");
@@ -87,14 +107,22 @@ fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
 
+    let args: Vec<String> = env::args().collect();
+    let directory = if args.len() > 2 && args[1] == "--directory" {
+        args[2].clone()
+    } else {
+        ".".to_string() // Default to current dir
+    };
+
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 println!("accepted new connection");
-                thread::spawn(|| {
-                    handle_connection(stream);
+                let dir = directory.clone();
+                thread::spawn( || {
+                    handle_connection(stream, dir);
                 });
             }
             Err(e) => {
