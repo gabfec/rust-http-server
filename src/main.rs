@@ -17,6 +17,7 @@ struct HttpRequest {
     method: HttpMethod,
     path: String,
     headers: HashMap<String, String>,
+    body: Vec<u8>,
 }
 
 impl HttpRequest {
@@ -28,10 +29,19 @@ impl HttpRequest {
             return None;
         }
 
-        let request_str = String::from_utf8_lossy(&buffer);
-        let mut lines = request_str.lines();
+        // Find the delimiter between Headers and Body
+        let separator = buffer[..bytes_read]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
 
-        // Parse Request Line
+        let header_bytes = &buffer[..separator];
+        let body_bytes = &buffer[separator + 4..bytes_read]; // Skip the 4 bytes of \r\n\r\n
+
+        // Parse Headers from the header_bytes
+        let header_str = String::from_utf8_lossy(header_bytes);
+        let mut lines = header_str.lines();
+
+        // Parse Request line
         let first_line = lines.next()?;
         let parts: Vec<&str> = first_line.split_whitespace().collect();
         let method = match parts.get(0)? {
@@ -51,7 +61,11 @@ impl HttpRequest {
             }
         }
 
-        Some(HttpRequest { method, path, headers })
+        // Handle Body
+        let mut body = Vec::new();
+        body.extend_from_slice(body_bytes);
+
+        Some(HttpRequest { method, path, headers, body })
     }
 }
 
@@ -75,17 +89,36 @@ fn handle_connection(mut stream: TcpStream, directory: String) {
                 let filename = &path[7..]; // Strip "/files/"
                 let file_path = Path::new(&directory).join(filename);
 
-                if file_path.exists() {
-                    let content = fs::read(&file_path).unwrap();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
-                        content.len()
-                    );
-                    // Send headers first, then the raw binary body
-                    stream.write_all(response.as_bytes()).unwrap();
-                    stream.write_all(&content).unwrap();
-                } else {
-                    stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+                match request.method {
+                    HttpMethod::GET => {
+                        println!("GET {}", file_path.display());
+
+                        if file_path.exists() {
+                            let content = fs::read(&file_path).unwrap();
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                                content.len()
+                            );
+                            // Send headers first, then the raw binary body
+                            stream.write_all(response.as_bytes()).unwrap();
+                            stream.write_all(&content).unwrap();
+                        } else {
+                            stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+                        }
+                    }
+                    HttpMethod::POST => {
+                        println!("POST {}", file_path.display());
+
+                        // Write the body to the file
+                        match fs::write(file_path, &request.body) {
+                            Ok(_) => {
+                                stream.write_all(b"HTTP/1.1 201 Created\r\n\r\n").unwrap();
+                            }
+                            Err(_) => {
+                                stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\n\r\n").unwrap();
+                            }
+                        }
+                    },
                 }
             }
             "/user-agent" => {
