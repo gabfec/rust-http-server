@@ -34,11 +34,8 @@ impl HttpRequest {
             .windows(4)
             .position(|window| window == b"\r\n\r\n")?;
 
-        let header_bytes = &buffer[..separator];
-        let body_bytes = &buffer[separator + 4..bytes_read]; // Skip the 4 bytes of \r\n\r\n
-
         // Parse Headers from the header_bytes
-        let header_str = String::from_utf8_lossy(header_bytes);
+        let header_str = String::from_utf8_lossy(&buffer[..separator]);
         let mut lines = header_str.lines();
 
         // Parse Request line
@@ -62,8 +59,22 @@ impl HttpRequest {
         }
 
         // Handle Body
+        let content_length = headers.get("content-length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
         let mut body = Vec::new();
-        body.extend_from_slice(body_bytes);
+        // Add what was already read into the initial buffer after the headers
+        let initial_body_part = &buffer[separator + 4..bytes_read];
+        body.extend_from_slice(initial_body_part);
+
+        // Continue reading if the body was truncated in the first read
+        while body.len() < content_length {
+            let mut chunk = [0; 2048];
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 { break; }
+            body.extend_from_slice(&chunk[..n]);
+        }
 
         Some(HttpRequest { method, path, headers, body })
     }
