@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::env;
-use std::fs;
 use std::thread;
-use std::path::Path;
 
 #[derive(Debug)]
 enum HttpMethod {
@@ -16,6 +14,13 @@ enum HttpMethod {
 struct HttpRequest {
     method: HttpMethod,
     path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
@@ -80,71 +85,88 @@ impl HttpRequest {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, directory: String) {
-    if let Some(request) = HttpRequest::from_stream(&stream) {
-        println!("Request received for path: {}", request.path);
+impl HttpResponse {
+    // A helper to make creating common responses easier
+    fn new(status: &str, content_type: &str, body: Vec<u8>) -> Self {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), content_type.to_string());
 
-        match request.path.as_str() {
-            "/" => stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap(),
-            // Fill the body of the response with the content of the path
-            path if path.starts_with("/echo/") => {
-                let content = &path[6..];
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                    content.len(),
-                    content
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            },
-            path if path.starts_with("/files/") => {
-                let filename = &path[7..]; // Strip "/files/"
-                let file_path = Path::new(&directory).join(filename);
-
-                match request.method {
-                    HttpMethod::GET => {
-                        println!("GET {}", file_path.display());
-
-                        if file_path.exists() {
-                            let content = fs::read(&file_path).unwrap();
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
-                                content.len()
-                            );
-                            // Send headers first, then the raw binary body
-                            stream.write_all(response.as_bytes()).unwrap();
-                            stream.write_all(&content).unwrap();
-                        } else {
-                            stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
-                        }
-                    }
-                    HttpMethod::POST => {
-                        println!("POST {}", file_path.display());
-
-                        // Write the body to the file
-                        match fs::write(file_path, &request.body) {
-                            Ok(_) => {
-                                stream.write_all(b"HTTP/1.1 201 Created\r\n\r\n").unwrap();
-                            }
-                            Err(_) => {
-                                stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\n\r\n").unwrap();
-                            }
-                        }
-                    },
-                }
-            }
-            "/user-agent" => {
-                // Look up the header (keys are lowercase because we normalized them)
-                let ua = request.headers.get("user-agent").map(|s| s.as_str()).unwrap_or("");
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                    ua.len(),
-                    ua
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            }
-            _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap(),
+        Self {
+            status: status.to_string(),
+            headers,
+            body,
         }
     }
+}
+
+fn send_response(mut stream: TcpStream, req: HttpRequest, mut res: HttpResponse) {
+    // Update Content-Length based on the final body size
+    res.headers.insert("Content-Length".to_string(), res.body.len().to_string());
+
+    // Construct the header string
+    let mut response_string = format!("HTTP/1.1 {}\r\n", res.status);
+    for (key, value) in &res.headers {
+        response_string.push_str(&format!("{}: {}\r\n", key, value));
+    }
+    response_string.push_str("\r\n"); // The critical empty line
+
+    // Send everything
+    stream.write_all(response_string.as_bytes()).unwrap();
+    stream.write_all(&res.body).unwrap();
+}
+
+fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -> HttpResponse {
+    let filename = &path[7..];
+    let file_path = std::path::Path::new(directory).join(filename);
+
+    match request.method {
+        HttpMethod::GET => {
+            if file_path.exists() {
+                let content = std::fs::read(file_path).unwrap_or_default();
+                HttpResponse::new("200 OK", "application/octet-stream", content)
+            } else {
+                HttpResponse::new("404 Not Found", "text/plain", vec![])
+            }
+        }
+        HttpMethod::POST => {
+            match std::fs::write(file_path, &request.body) {
+                Ok(_) => HttpResponse::new("201 Created", "text/plain", vec![]),
+                Err(_) => HttpResponse::new("500 Internal Server Error", "text/plain", vec![]),
+            }
+        }
+    }
+}
+
+fn handle_connection(stream: TcpStream, directory: String) {
+    let request = match HttpRequest::from_stream(&stream) {
+        Some(req) => req,
+        None => return,
+    };
+
+    println!("Request received for path: {}", request.path);
+
+    let response = match request.path.as_str() {
+        "/" => HttpResponse::new("200 OK", "text/plain", vec![]),
+
+        p if p.starts_with("/echo/") => {
+            let content = p[6..].as_bytes().to_vec();
+            HttpResponse::new("200 OK", "text/plain", content)
+        }
+
+        "/user-agent" => {
+            let ua = request.headers.get("user-agent").cloned().unwrap_or_default();
+            HttpResponse::new("200 OK", "text/plain", ua.into_bytes())
+        }
+
+        p if p.starts_with("/files/") => {
+            handle_file_request(p, &request, &directory)
+        }
+
+        _ => HttpResponse::new("404 Not Found", "text/plain", vec![]),
+    };
+
+    // This is where the magic happens: GZIP, Headers, and Writing
+    send_response(stream, request, response);
 }
 
 fn main() {
