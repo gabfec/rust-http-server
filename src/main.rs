@@ -28,61 +28,66 @@ struct HttpResponse {
 
 impl HttpRequest {
     fn from_stream(mut stream: &TcpStream) -> Option<Self> {
-        let mut buffer = [0; 2048];
+        let mut buffer = [0; 4096]; // Slightly larger buffer is safer
         let bytes_read = stream.read(&mut buffer).ok()?;
-
         if bytes_read == 0 {
             return None;
         }
 
-        // Find the delimiter between Headers and Body
-        let separator = buffer[..bytes_read]
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")?;
+        let (header_part, body_initial) = Self::split_request(&buffer[..bytes_read])?;
 
-        // Parse Headers from the header_bytes
-        let header_str = String::from_utf8_lossy(&buffer[..separator]);
-        let mut lines = header_str.lines();
+        // Parse Metadata
+        let mut lines = header_part.lines();
+        let (method, path) = Self::parse_request_line(lines.next()?)?;
+        let headers = Self::parse_headers(&mut lines);
 
-        // Parse Request line
-        let first_line = lines.next()?;
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
-        let method = match parts.get(0)? {
-            &"POST" => HttpMethod::POST,
-            _ => HttpMethod::GET,
-        };
-        let path = parts.get(1)?.to_string();
-
-        // Parse Headers
-        let mut headers = HashMap::new();
-        for line in lines {
-            if line.is_empty() {
-                break; // End of headers
-            }
-            if let Some((key, value)) = line.split_once(": ") {
-                headers.insert(key.to_lowercase(), value.to_string());
-            }
-        }
-
-        // Handle Body
-        let content_length = headers.get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-
-        let mut body = Vec::new();
-        // Add what was already read into the initial buffer after the headers
-        let initial_body_part = &buffer[separator + 4..bytes_read];
-        body.extend_from_slice(initial_body_part);
-
-        // Continue reading if the body was truncated in the first read
-        while body.len() < content_length {
-            let mut chunk = [0; 2048];
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 { break; }
-            body.extend_from_slice(&chunk[..n]);
-        }
+        // Handle Body (including multi-read)
+        let body = Self::read_full_body(stream, body_initial, &headers);
 
         Some(HttpRequest { method, path, headers, body })
+    }
+
+    // Helper: Split bytes into header string and initial body slice
+    fn split_request(buffer: &[u8]) -> Option<(String, &[u8])> {
+        let pos = buffer.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let header_str = String::from_utf8_lossy(&buffer[..pos]).to_string();
+        Some((header_str, &buffer[pos + 4..]))
+    }
+
+    // Helper: Parse first line
+    fn parse_request_line(line: &str) -> Option<(HttpMethod, String)> {
+        let mut parts = line.split_whitespace();
+        let method = match parts.next()? {
+            "POST" => HttpMethod::POST,
+            _ => HttpMethod::GET,
+        };
+        let path = parts.next()?.to_string();
+        Some((method, path))
+    }
+
+    // Helper: Parse headers into HashMap using functional style
+    fn parse_headers(lines: &mut std::str::Lines) -> HashMap<String, String> {
+        lines
+            .filter_map(|line| line.split_once(": "))
+            .map(|(k, v)| (k.to_lowercase(), v.to_string()))
+            .collect()
+    }
+
+    // Helper: Complete the body read
+    fn read_full_body(mut stream: &TcpStream, initial: &[u8], headers: &HashMap<String, String>) -> Vec<u8> {
+        let content_length = headers.get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let mut body = initial.to_vec();
+        while body.len() < content_length {
+            let mut chunk = [0; 2048];
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+            }
+        }
+        body
     }
 }
 
