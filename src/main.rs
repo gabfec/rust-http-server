@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::env;
 use std::thread;
+use flate2::{Compression, write::GzEncoder};
 
 #[derive(Debug)]
 enum HttpMethod {
@@ -99,7 +100,20 @@ impl HttpResponse {
     }
 }
 
+fn compress_body(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap() // Returns the compressed Vec<u8>
+}
+
 fn send_response(mut stream: TcpStream, req: HttpRequest, mut res: HttpResponse) {
+    // Handle GZIP Compression
+    let accept_encoding = req.headers.get("accept-encoding").map(|s| s.as_str()).unwrap_or("");
+    if accept_encoding.split(',').any(|s| s.trim() == "gzip") {
+        res.body = compress_body(&res.body);
+        res.headers.insert("Content-Encoding".to_string(), "gzip".to_string());
+    }
+
     // Update Content-Length based on the final body size
     res.headers.insert("Content-Length".to_string(), res.body.len().to_string());
 
