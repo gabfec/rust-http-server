@@ -113,6 +113,13 @@ fn send_response(mut stream: &TcpStream, req: &HttpRequest, mut res: HttpRespons
     // Update Content-Length based on the final body size
     res.headers.insert("Content-Length".to_string(), res.body.len().to_string());
 
+    // If the client asked to close, we should echo that back
+    if let Some(conn) = req.headers.get("connection") {
+        if conn.to_lowercase() == "close" {
+            res.headers.insert("Connection".to_string(), "close".to_string());
+        }
+    }
+
     // Construct the header string
     let mut response_string = format!("HTTP/1.1 {}\r\n", res.status);
     for (key, value) in &res.headers {
@@ -154,7 +161,10 @@ fn handle_connection(stream: TcpStream, directory: String) {
     loop {
         let request = match HttpRequest::from_stream(&mut reader) {
             Some(req) => req,
-            None => break, // Client closed connection or sent invalid data
+            None => {
+                println!("Connection closed by client.");
+                break;
+            }
         };
 
         println!("Request received for path: {}", request.path);
@@ -181,6 +191,14 @@ fn handle_connection(stream: TcpStream, directory: String) {
 
         // This is where the magic happens: GZIP, Headers, and Writing
         send_response(&stream, &request, response);
+
+        // Check if we should close the connection
+        // HTTP/1.1 is persistent by default, but clients can send "Connection: close"
+        if let Some(conn_header) = request.headers.get("connection") {
+            if conn_header.to_lowercase() == "close" {
+                break;
+            }
+        }
     }
 }
 
