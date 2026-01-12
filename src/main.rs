@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::env;
 use std::thread;
 use flate2::{Compression, write::GzEncoder};
@@ -27,67 +27,58 @@ struct HttpResponse {
 }
 
 impl HttpRequest {
-    fn from_stream(mut stream: &TcpStream) -> Option<Self> {
-        let mut buffer = [0; 4096]; // Slightly larger buffer is safer
-        let bytes_read = stream.read(&mut buffer).ok()?;
-        if bytes_read == 0 {
+    fn from_stream(reader: &mut BufReader<&TcpStream>) -> Option<Self> {
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).ok()?;
+        if first_line.is_empty() {
             return None;
         }
 
-        let (header_part, body_initial) = Self::split_request(&buffer[..bytes_read])?;
-
         // Parse Metadata
-        let mut lines = header_part.lines();
-        let (method, path) = Self::parse_request_line(lines.next()?)?;
-        let headers = Self::parse_headers(&mut lines);
+        let (method, path) = Self::parse_request_line(&first_line)?;
+        let headers = Self::parse_headers(reader)?;
 
         // Handle Body (including multi-read)
-        let body = Self::read_full_body(stream, body_initial, &headers);
+        let body = Self::read_body(reader, &headers)?;
 
         Some(HttpRequest { method, path, headers, body })
     }
 
-    // Helper: Split bytes into header string and initial body slice
-    fn split_request(buffer: &[u8]) -> Option<(String, &[u8])> {
-        let pos = buffer.windows(4).position(|w| w == b"\r\n\r\n")?;
-        let header_str = String::from_utf8_lossy(&buffer[..pos]).to_string();
-        Some((header_str, &buffer[pos + 4..]))
-    }
-
     // Helper: Parse first line
     fn parse_request_line(line: &str) -> Option<(HttpMethod, String)> {
-        let mut parts = line.split_whitespace();
-        let method = match parts.next()? {
-            "POST" => HttpMethod::POST,
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let method = match parts.get(0)? {
+            &"POST" => HttpMethod::POST,
             _ => HttpMethod::GET,
         };
-        let path = parts.next()?.to_string();
+        let path = parts.get(1)?.to_string();
         Some((method, path))
     }
 
     // Helper: Parse headers into HashMap using functional style
-    fn parse_headers(lines: &mut std::str::Lines) -> HashMap<String, String> {
-        lines
-            .filter_map(|line| line.split_once(": "))
-            .map(|(k, v)| (k.to_lowercase(), v.to_string()))
-            .collect()
+    fn parse_headers(reader: &mut BufReader<&TcpStream>) -> Option<HashMap<String, String>> {
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).ok()?;
+            if line == "\r\n" || line == "\n" { break; }
+
+            if let Some((k, v)) = line.split_once(": ") {
+                headers.insert(k.to_lowercase(), v.trim().to_string());
+            }
+        }
+        Some(headers)
     }
 
     // Helper: Complete the body read
-    fn read_full_body(mut stream: &TcpStream, initial: &[u8], headers: &HashMap<String, String>) -> Vec<u8> {
-        let content_length = headers.get("content-length")
+    fn read_body(reader: &mut BufReader<&TcpStream>, headers: &HashMap<String, String>) -> Option<Vec<u8>> {
+        let len = headers.get("content-length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        let mut body = initial.to_vec();
-        while body.len() < content_length {
-            let mut chunk = [0; 2048];
-            match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => body.extend_from_slice(&chunk[..n]),
-            }
-        }
-        body
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).ok()?;
+        Some(body)
     }
 }
 
@@ -111,7 +102,7 @@ fn compress_body(data: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap() // Returns the compressed Vec<u8>
 }
 
-fn send_response(mut stream: TcpStream, req: HttpRequest, mut res: HttpResponse) {
+fn send_response(mut stream: &TcpStream, req: &HttpRequest, mut res: HttpResponse) {
     // Handle GZIP Compression
     let accept_encoding = req.headers.get("accept-encoding").map(|s| s.as_str()).unwrap_or("");
     if accept_encoding.split(',').any(|s| s.trim() == "gzip") {
@@ -132,6 +123,7 @@ fn send_response(mut stream: TcpStream, req: HttpRequest, mut res: HttpResponse)
     // Send everything
     stream.write_all(response_string.as_bytes()).unwrap();
     stream.write_all(&res.body).unwrap();
+    stream.flush().unwrap(); // Critical for persistent connections!
 }
 
 fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -> HttpResponse {
@@ -157,35 +149,39 @@ fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -> Ht
 }
 
 fn handle_connection(stream: TcpStream, directory: String) {
-    let request = match HttpRequest::from_stream(&stream) {
-        Some(req) => req,
-        None => return,
-    };
+    let mut reader = BufReader::new(&stream);
 
-    println!("Request received for path: {}", request.path);
+    loop {
+        let request = match HttpRequest::from_stream(&mut reader) {
+            Some(req) => req,
+            None => break, // Client closed connection or sent invalid data
+        };
 
-    let response = match request.path.as_str() {
-        "/" => HttpResponse::new("200 OK", "text/plain", vec![]),
+        println!("Request received for path: {}", request.path);
 
-        p if p.starts_with("/echo/") => {
-            let content = p[6..].as_bytes().to_vec();
-            HttpResponse::new("200 OK", "text/plain", content)
-        }
+        let response = match request.path.as_str() {
+            "/" => HttpResponse::new("200 OK", "text/plain", vec![]),
 
-        "/user-agent" => {
-            let ua = request.headers.get("user-agent").cloned().unwrap_or_default();
-            HttpResponse::new("200 OK", "text/plain", ua.into_bytes())
-        }
+            p if p.starts_with("/echo/") => {
+                let content = p[6..].as_bytes().to_vec();
+                HttpResponse::new("200 OK", "text/plain", content)
+            }
 
-        p if p.starts_with("/files/") => {
-            handle_file_request(p, &request, &directory)
-        }
+            "/user-agent" => {
+                let ua = request.headers.get("user-agent").cloned().unwrap_or_default();
+                HttpResponse::new("200 OK", "text/plain", ua.into_bytes())
+            }
 
-        _ => HttpResponse::new("404 Not Found", "text/plain", vec![]),
-    };
+            p if p.starts_with("/files/") => {
+                handle_file_request(p, &request, &directory)
+            }
 
-    // This is where the magic happens: GZIP, Headers, and Writing
-    send_response(stream, request, response);
+            _ => HttpResponse::new("404 Not Found", "text/plain", vec![]),
+        };
+
+        // This is where the magic happens: GZIP, Headers, and Writing
+        send_response(&stream, &request, response);
+    }
 }
 
 fn main() {
