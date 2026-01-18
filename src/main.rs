@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use std::net::{TcpListener, TcpStream};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::env;
-use std::thread;
 use flate2::{Compression, write::GzEncoder};
+use std::collections::HashMap;
+use std::env;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
 
 #[derive(Debug)]
 enum HttpMethod {
@@ -41,7 +41,12 @@ impl HttpRequest {
         // Handle Body (including multi-read)
         let body = Self::read_body(reader, &headers)?;
 
-        Some(HttpRequest { method, path, headers, body })
+        Some(HttpRequest {
+            method,
+            path,
+            headers,
+            body,
+        })
     }
 
     // Helper: Parse first line
@@ -61,7 +66,9 @@ impl HttpRequest {
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).ok()?;
-            if line == "\r\n" || line == "\n" { break; }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
 
             if let Some((k, v)) = line.split_once(": ") {
                 headers.insert(k.to_lowercase(), v.trim().to_string());
@@ -71,8 +78,12 @@ impl HttpRequest {
     }
 
     // Helper: Complete the body read
-    fn read_body(reader: &mut BufReader<&TcpStream>, headers: &HashMap<String, String>) -> Option<Vec<u8>> {
-        let len = headers.get("content-length")
+    fn read_body(
+        reader: &mut BufReader<&TcpStream>,
+        headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        let len = headers
+            .get("content-length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
@@ -104,19 +115,26 @@ fn compress_body(data: &[u8]) -> Vec<u8> {
 
 fn send_response(mut stream: &TcpStream, req: &HttpRequest, mut res: HttpResponse) {
     // Handle GZIP Compression
-    let accept_encoding = req.headers.get("accept-encoding").map(|s| s.as_str()).unwrap_or("");
+    let accept_encoding = req
+        .headers
+        .get("accept-encoding")
+        .map(|s| s.as_str())
+        .unwrap_or("");
     if accept_encoding.split(',').any(|s| s.trim() == "gzip") {
         res.body = compress_body(&res.body);
-        res.headers.insert("Content-Encoding".to_string(), "gzip".to_string());
+        res.headers
+            .insert("Content-Encoding".to_string(), "gzip".to_string());
     }
 
     // Update Content-Length based on the final body size
-    res.headers.insert("Content-Length".to_string(), res.body.len().to_string());
+    res.headers
+        .insert("Content-Length".to_string(), res.body.len().to_string());
 
     // If the client asked to close, we should echo that back
     if let Some(conn) = req.headers.get("connection") {
         if conn.to_lowercase() == "close" {
-            res.headers.insert("Connection".to_string(), "close".to_string());
+            res.headers
+                .insert("Connection".to_string(), "close".to_string());
         }
     }
 
@@ -146,12 +164,10 @@ fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -> Ht
                 HttpResponse::new("404 Not Found", "text/plain", vec![])
             }
         }
-        HttpMethod::POST => {
-            match std::fs::write(file_path, &request.body) {
-                Ok(_) => HttpResponse::new("201 Created", "text/plain", vec![]),
-                Err(_) => HttpResponse::new("500 Internal Server Error", "text/plain", vec![]),
-            }
-        }
+        HttpMethod::POST => match std::fs::write(file_path, &request.body) {
+            Ok(_) => HttpResponse::new("201 Created", "text/plain", vec![]),
+            Err(_) => HttpResponse::new("500 Internal Server Error", "text/plain", vec![]),
+        },
     }
 }
 
@@ -178,13 +194,15 @@ fn handle_connection(stream: TcpStream, directory: String) {
             }
 
             "/user-agent" => {
-                let ua = request.headers.get("user-agent").cloned().unwrap_or_default();
+                let ua = request
+                    .headers
+                    .get("user-agent")
+                    .cloned()
+                    .unwrap_or_default();
                 HttpResponse::new("200 OK", "text/plain", ua.into_bytes())
             }
 
-            p if p.starts_with("/files/") => {
-                handle_file_request(p, &request, &directory)
-            }
+            p if p.starts_with("/files/") => handle_file_request(p, &request, &directory),
 
             _ => HttpResponse::new("404 Not Found", "text/plain", vec![]),
         };
@@ -220,7 +238,7 @@ fn main() {
             Ok(stream) => {
                 println!("accepted new connection");
                 let dir = directory.clone();
-                thread::spawn( || {
+                thread::spawn(|| {
                     handle_connection(stream, dir);
                 });
             }
