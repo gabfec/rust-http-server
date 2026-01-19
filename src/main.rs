@@ -7,8 +7,8 @@ use std::thread;
 
 #[derive(Debug)]
 enum HttpMethod {
-    GET,
-    POST,
+    Get,
+    Post,
 }
 
 #[derive(Debug)]
@@ -52,9 +52,9 @@ impl HttpRequest {
     // Helper: Parse first line
     fn parse_request_line(line: &str) -> Option<(HttpMethod, String)> {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        let method = match parts.get(0)? {
-            &"POST" => HttpMethod::POST,
-            _ => HttpMethod::GET,
+        let method = match parts.first()? {
+            &"POST" => HttpMethod::Post,
+            _ => HttpMethod::Get,
         };
         let path = parts.get(1)?.to_string();
         Some((method, path))
@@ -131,11 +131,11 @@ fn send_response(mut stream: &TcpStream, req: &HttpRequest, mut res: HttpRespons
         .insert("Content-Length".to_string(), res.body.len().to_string());
 
     // If the client asked to close, we should echo that back
-    if let Some(conn) = req.headers.get("connection") {
-        if conn.to_lowercase() == "close" {
-            res.headers
-                .insert("Connection".to_string(), "close".to_string());
-        }
+    if let Some(conn) = req.headers.get("connection")
+        && conn.to_lowercase() == "close"
+    {
+        res.headers
+            .insert("Connection".to_string(), "close".to_string());
     }
 
     // Construct the header string
@@ -156,7 +156,7 @@ fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -> Ht
     let file_path = std::path::Path::new(directory).join(filename);
 
     match request.method {
-        HttpMethod::GET => {
+        HttpMethod::Get => {
             if file_path.exists() {
                 let content = std::fs::read(file_path).unwrap_or_default();
                 HttpResponse::new("200 OK", "application/octet-stream", content)
@@ -164,7 +164,7 @@ fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -> Ht
                 HttpResponse::new("404 Not Found", "text/plain", vec![])
             }
         }
-        HttpMethod::POST => match std::fs::write(file_path, &request.body) {
+        HttpMethod::Post => match std::fs::write(file_path, &request.body) {
             Ok(_) => HttpResponse::new("201 Created", "text/plain", vec![]),
             Err(_) => HttpResponse::new("500 Internal Server Error", "text/plain", vec![]),
         },
@@ -189,7 +189,7 @@ fn handle_connection(stream: TcpStream, directory: String) {
             "/" => HttpResponse::new("200 OK", "text/plain", vec![]),
 
             p if p.starts_with("/echo/") => {
-                let content = p[6..].as_bytes().to_vec();
+                let content = p.as_bytes()[6..].to_vec();
                 HttpResponse::new("200 OK", "text/plain", content)
             }
 
@@ -212,10 +212,10 @@ fn handle_connection(stream: TcpStream, directory: String) {
 
         // Check if we should close the connection
         // HTTP/1.1 is persistent by default, but clients can send "Connection: close"
-        if let Some(conn_header) = request.headers.get("connection") {
-            if conn_header.to_lowercase() == "close" {
-                break;
-            }
+        if let Some(conn_header) = request.headers.get("connection")
+            && conn_header.to_lowercase() == "close"
+        {
+            break;
         }
     }
 }
