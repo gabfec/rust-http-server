@@ -1,38 +1,105 @@
-[![progress-banner](https://backend.codecrafters.io/progress/http-server/de041121-e0fc-4e1f-9615-5fc5941af9be)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# HTTP Server in Rust (Built from Scratch)
 
-This is a starting point for Rust solutions to the
-["Build Your Own HTTP server" Challenge](https://app.codecrafters.io/courses/http-server/overview).
+[![Tests](https://github.com/gabfec/rust-http-server/actions/workflows/rust.yml/badge.svg)](https://github.com/gabfec/rust-http-server/actions)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
+[![Made with Rust](https://img.shields.io/badge/Made%20with-Rust-red.svg)]()
+[![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
 
-[HTTP](https://en.wikipedia.org/wiki/Hypertext_Transfer_Protocol) is the
-protocol that powers the web. In this challenge, you'll build a HTTP/1.1 server
-that is capable of serving multiple clients.
+A minimal HTTP/1.1 server implemented from scratch in Rust using raw TCP sockets.
 
-Along the way you'll learn about TCP servers,
-[HTTP request syntax](https://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html),
-and more.
+---
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## Features
 
-# Passing the first stage
+- Manual HTTP/1.1 request parsing
+- Manual response construction
+- Thread-per-connection concurrency
+- Persistent connections (keep-alive)
+- Gzip compression (when `Accept-Encoding: gzip` is sent)
+- Static file serving
+- File upload via POST
+- Content-Length handling
+- Proper CRLF formatting
 
-The entry point for your HTTP server implementation is in `src/main.rs`. Study
-and uncomment the relevant code, and push your changes to pass the first stage:
+---
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
+## Supported Routes
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/` | GET | Returns `200 OK` |
+| `/echo/{text}` | GET | Returns `{text}` |
+| `/user-agent` | GET | Returns the `User-Agent` header |
+| `/files/{filename}` | GET | Serves file from directory |
+| `/files/{filename}` | POST | Writes body to file |
+
+Unknown routes return `404 Not Found`.
+
+---
+
+## Run
+
+Start the server:
+
+```bash
+cargo run
 ```
 
-Time to move on to the next stage!
+Serve files from a directory:
 
-# Stage 2 & beyond
+```bash
+cargo run -- --directory ./public
+```
 
-Note: This section is for stages 2 and beyond.
+Server runs on:
 
-1. Ensure you have `cargo (1.91)` installed locally
-1. Run `./your_program.sh` to run your program, which is implemented in
-   `src/main.rs`. This command compiles your Rust project, so it might be slow
-   the first time you run it. Subsequent runs will be fast.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+```
+127.0.0.1:4221
+```
+
+---
+
+## Example
+
+```bash
+curl http://localhost:4221/echo/hello
+curl -X POST --data "data" http://localhost:4221/files/test.txt
+curl -H "Accept-Encoding: gzip" http://localhost:4221/echo/hello
+```
+
+---
+
+## Project Structure
+
+```
+.
+├── main.rs
+├── server.rs
+├── handlers.rs
+├── utils.rs
+└── http/
+    ├── request.rs
+    └── response.rs
+```
+
+---
+
+## Tests
+
+Run tests:
+
+```bash
+cargo test
+```
+
+## Educational Purpose
+
+This project was built to understand TCP networking and HTTP/1.1 internals by implementing a server without external frameworks.
+
+Challenge by CodeCrafters: https://codecrafters.io
+
+---
+
+## License
+
+MIT License — see the `LICENSE` file.
