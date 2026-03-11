@@ -82,3 +82,112 @@ impl HttpRequest {
         Some(body)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufReader, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (server, client)
+    }
+
+    fn write_request_and_make_reader<'a>(
+        server: &'a TcpStream,
+        req: &[u8],
+        mut client: TcpStream,
+    ) -> BufReader<&'a TcpStream> {
+        client.write_all(req).unwrap();
+        client.flush().unwrap();
+        client.shutdown(Shutdown::Write).unwrap(); // ensure server doesn't hang waiting for more data
+        BufReader::new(server)
+    }
+
+    #[test]
+    fn parse_request_line_get_defaults_to_get() {
+        let (m, path) = HttpRequest::parse_request_line("GET /hello HTTP/1.1\r\n").unwrap();
+        assert!(matches!(m, HttpMethod::Get));
+        assert_eq!(path, "/hello");
+    }
+
+    #[test]
+    fn parse_request_line_post() {
+        let (m, path) = HttpRequest::parse_request_line("POST /files/a.txt HTTP/1.1\r\n").unwrap();
+        assert!(matches!(m, HttpMethod::Post));
+        assert_eq!(path, "/files/a.txt");
+    }
+
+    #[test]
+    fn from_stream_parses_get_no_body() {
+        let (server, client) = connected_pair();
+        let req_bytes = b"GET /echo/hello HTTP/1.1\r\nHost: localhost\r\nUser-Agent: curl\r\n\r\n";
+
+        let mut reader = write_request_and_make_reader(&server, req_bytes, client);
+        let req = HttpRequest::from_stream(&mut reader).unwrap();
+
+        assert!(matches!(req.method, HttpMethod::Get));
+        assert_eq!(req.path, "/echo/hello");
+        assert_eq!(
+            req.headers.get("host").map(|s| s.as_str()),
+            Some("localhost")
+        );
+        assert_eq!(
+            req.headers.get("user-agent").map(|s| s.as_str()),
+            Some("curl")
+        );
+        assert!(req.body.is_empty());
+    }
+
+    #[test]
+    fn from_stream_parses_post_with_body() {
+        let (server, client) = connected_pair();
+
+        let body = b"hello world";
+        let req = format!(
+            "POST /files/x.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+
+        let mut reader = write_request_and_make_reader(&server, req.as_bytes(), client);
+        let req = HttpRequest::from_stream(&mut reader).unwrap();
+
+        assert!(matches!(req.method, HttpMethod::Post));
+        assert_eq!(req.path, "/files/x.txt");
+        assert_eq!(
+            req.headers.get("content-length").unwrap(),
+            &body.len().to_string()
+        );
+        assert_eq!(req.body, body);
+    }
+
+    #[test]
+    fn header_keys_are_lowercased() {
+        let (server, client) = connected_pair();
+        let req_bytes = b"GET / HTTP/1.1\r\nUser-Agent: TestUA\r\nX-Custom: Value\r\n\r\n";
+
+        let mut reader = write_request_and_make_reader(&server, req_bytes, client);
+        let req = HttpRequest::from_stream(&mut reader).unwrap();
+
+        assert_eq!(req.headers.get("user-agent").unwrap(), "TestUA");
+        assert_eq!(req.headers.get("x-custom").unwrap(), "Value");
+        assert!(req.headers.get("User-Agent").is_none());
+    }
+
+    #[test]
+    fn returns_none_on_closed_connection() {
+        let (server, client) = connected_pair();
+        // Immediately close client's write side without sending anything
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut reader = BufReader::new(&server);
+        let req = HttpRequest::from_stream(&mut reader);
+        assert!(req.is_none());
+    }
+}

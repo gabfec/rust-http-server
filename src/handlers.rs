@@ -20,3 +20,150 @@ pub fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::request::HttpMethod;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::io::Read;
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (server, client)
+    }
+
+    fn read_to_end(mut client: TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    fn split_headers_body(resp: &[u8]) -> (&[u8], &[u8]) {
+        let needle = b"\r\n\r\n";
+        let idx = resp
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("missing header/body separator");
+        (&resp[..idx], &resp[idx + needle.len()..])
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        dir.push(format!("cc_http_server_test_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn req_for_send() -> crate::http::HttpRequest {
+        // Make the server echo Connection: close so tests can read to end after shutdown
+        let mut headers = HashMap::new();
+        headers.insert("connection".to_string(), "close".to_string());
+
+        crate::http::HttpRequest {
+            method: HttpMethod::Get,
+            path: "/".to_string(),
+            headers,
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn file_get_existing_returns_200_and_body() {
+        let dir = make_temp_dir();
+        let file_path = dir.join("a.txt");
+        fs::write(&file_path, b"abc").unwrap();
+
+        let request = crate::http::HttpRequest {
+            method: HttpMethod::Get,
+            path: "/files/a.txt".to_string(),
+            headers: HashMap::new(),
+            body: vec![],
+        };
+
+        let resp = handle_file_request("/files/a.txt", &request, dir.to_str().unwrap());
+
+        let (server, client) = connected_pair();
+        let req = req_for_send();
+        resp.send(&server, &req);
+        server.shutdown(Shutdown::Write).unwrap();
+
+        let raw = read_to_end(client);
+        let (hdrs, body) = split_headers_body(&raw);
+        let hdrs_str = std::str::from_utf8(hdrs).unwrap();
+
+        assert!(hdrs_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(body, b"abc");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_get_missing_returns_404() {
+        let dir = make_temp_dir();
+
+        let request = crate::http::HttpRequest {
+            method: HttpMethod::Get,
+            path: "/files/missing.txt".to_string(),
+            headers: HashMap::new(),
+            body: vec![],
+        };
+
+        let resp = handle_file_request("/files/missing.txt", &request, dir.to_str().unwrap());
+
+        let (server, client) = connected_pair();
+        let req = req_for_send();
+        resp.send(&server, &req);
+        server.shutdown(Shutdown::Write).unwrap();
+
+        let raw = read_to_end(client);
+        let (hdrs, _body) = split_headers_body(&raw);
+        let hdrs_str = std::str::from_utf8(hdrs).unwrap();
+
+        assert!(hdrs_str.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_post_creates_file_and_returns_201() {
+        let dir = make_temp_dir();
+
+        let request = crate::http::HttpRequest {
+            method: HttpMethod::Post,
+            path: "/files/new.txt".to_string(),
+            headers: HashMap::new(),
+            body: b"hello".to_vec(),
+        };
+
+        let resp = handle_file_request("/files/new.txt", &request, dir.to_str().unwrap());
+
+        // verify file written
+        let written = fs::read(dir.join("new.txt")).unwrap();
+        assert_eq!(written, b"hello");
+
+        // verify status 201
+        let (server, client) = connected_pair();
+        let req = req_for_send();
+        resp.send(&server, &req);
+        server.shutdown(Shutdown::Write).unwrap();
+
+        let raw = read_to_end(client);
+        let (hdrs, _body) = split_headers_body(&raw);
+        let hdrs_str = std::str::from_utf8(hdrs).unwrap();
+        assert!(hdrs_str.starts_with("HTTP/1.1 201 Created\r\n"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
