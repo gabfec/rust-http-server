@@ -1,20 +1,26 @@
 use crate::http::request::HttpMethod;
 use crate::http::{HttpRequest, HttpResponse};
 
-pub fn handle_file_request(path: &str, request: &HttpRequest, directory: &str) -> HttpResponse {
+pub async fn handle_file_request(
+    path: &str,
+    request: &HttpRequest,
+    directory: &str,
+) -> HttpResponse {
     let filename = &path[7..];
     let file_path = std::path::Path::new(directory).join(filename);
 
     match request.method {
         HttpMethod::Get => {
             if file_path.exists() {
-                let content = std::fs::read(file_path).unwrap_or_default();
-                HttpResponse::new("200 OK", "application/octet-stream", content)
+                match tokio::fs::read(file_path).await {
+                    Ok(content) => HttpResponse::new("200 OK", "application/octet-stream", content),
+                    Err(_) => HttpResponse::new("500 Internal Server Error", "text/plain", vec![]),
+                }
             } else {
                 HttpResponse::new("404 Not Found", "text/plain", vec![])
             }
         }
-        HttpMethod::Post => match std::fs::write(file_path, &request.body) {
+        HttpMethod::Post => match tokio::fs::write(file_path, &request.body).await {
             Ok(_) => HttpResponse::new("201 Created", "text/plain", vec![]),
             Err(_) => HttpResponse::new("500 Internal Server Error", "text/plain", vec![]),
         },
@@ -27,22 +33,29 @@ mod tests {
     use crate::http::request::HttpMethod;
     use std::collections::HashMap;
     use std::fs;
-    use std::io::Read;
-    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
-    fn connected_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    async fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
-        let (server, _) = listener.accept().unwrap();
+
+        let client_fut = TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+
+        let (client_res, server_res) = tokio::join!(client_fut, accept_fut);
+
+        let client = client_res.unwrap();
+        let (server, _) = server_res.unwrap();
+
         (server, client)
     }
 
-    fn read_to_end(mut client: TcpStream) -> Vec<u8> {
+    async fn read_to_end(mut client: TcpStream) -> Vec<u8> {
         let mut buf = Vec::new();
-        client.read_to_end(&mut buf).unwrap();
+        client.read_to_end(&mut buf).await.unwrap();
         buf
     }
 
@@ -79,8 +92,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn file_get_existing_returns_200_and_body() {
+    #[tokio::test]
+    async fn file_get_existing_returns_200_and_body() {
         let dir = make_temp_dir();
         let file_path = dir.join("a.txt");
         fs::write(&file_path, b"abc").unwrap();
@@ -92,14 +105,14 @@ mod tests {
             body: vec![],
         };
 
-        let resp = handle_file_request("/files/a.txt", &request, dir.to_str().unwrap());
+        let resp = handle_file_request("/files/a.txt", &request, dir.to_str().unwrap()).await;
 
-        let (server, client) = connected_pair();
+        let (mut server, client) = connected_pair().await;
         let req = req_for_send();
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_to_end(client);
+        let raw = read_to_end(client).await;
         let (hdrs, body) = split_headers_body(&raw);
         let hdrs_str = std::str::from_utf8(hdrs).unwrap();
 
@@ -109,8 +122,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn file_get_missing_returns_404() {
+    #[tokio::test]
+    async fn file_get_missing_returns_404() {
         let dir = make_temp_dir();
 
         let request = crate::http::HttpRequest {
@@ -120,14 +133,14 @@ mod tests {
             body: vec![],
         };
 
-        let resp = handle_file_request("/files/missing.txt", &request, dir.to_str().unwrap());
+        let resp = handle_file_request("/files/missing.txt", &request, dir.to_str().unwrap()).await;
 
-        let (server, client) = connected_pair();
+        let (mut server, client) = connected_pair().await;
         let req = req_for_send();
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_to_end(client);
+        let raw = read_to_end(client).await;
         let (hdrs, _body) = split_headers_body(&raw);
         let hdrs_str = std::str::from_utf8(hdrs).unwrap();
 
@@ -136,8 +149,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn file_post_creates_file_and_returns_201() {
+    #[tokio::test]
+    async fn file_post_creates_file_and_returns_201() {
         let dir = make_temp_dir();
 
         let request = crate::http::HttpRequest {
@@ -147,21 +160,22 @@ mod tests {
             body: b"hello".to_vec(),
         };
 
-        let resp = handle_file_request("/files/new.txt", &request, dir.to_str().unwrap());
+        let resp = handle_file_request("/files/new.txt", &request, dir.to_str().unwrap()).await;
 
         // verify file written
         let written = fs::read(dir.join("new.txt")).unwrap();
         assert_eq!(written, b"hello");
 
         // verify status 201
-        let (server, client) = connected_pair();
+        let (mut server, client) = connected_pair().await;
         let req = req_for_send();
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_to_end(client);
+        let raw = read_to_end(client).await;
         let (hdrs, _body) = split_headers_body(&raw);
         let hdrs_str = std::str::from_utf8(hdrs).unwrap();
+
         assert!(hdrs_str.starts_with("HTTP/1.1 201 Created\r\n"));
 
         let _ = fs::remove_dir_all(&dir);

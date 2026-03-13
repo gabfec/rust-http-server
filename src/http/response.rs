@@ -1,8 +1,8 @@
 use crate::http::HttpRequest;
 use crate::utils;
 use std::collections::HashMap;
-use std::io::Write;
-use std::net::TcpStream;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 #[derive(Debug)]
 pub struct HttpResponse {
@@ -24,13 +24,18 @@ impl HttpResponse {
         }
     }
 
-    pub fn send(mut self, mut stream: &TcpStream, req: &HttpRequest) {
+    pub async fn send(
+        mut self,
+        stream: &mut TcpStream,
+        req: &HttpRequest,
+    ) -> tokio::io::Result<()> {
         // Handle GZIP Compression
         let accept_encoding = req
             .headers
             .get("accept-encoding")
             .map(|s| s.as_str())
             .unwrap_or("");
+
         if accept_encoding.split(',').any(|s| s.trim() == "gzip") {
             self.body = utils::compress_body(&self.body);
             self.headers
@@ -57,9 +62,11 @@ impl HttpResponse {
         response_string.push_str("\r\n"); // The critical empty line
 
         // Send everything
-        stream.write_all(response_string.as_bytes()).unwrap();
-        stream.write_all(&self.body).unwrap();
-        stream.flush().unwrap(); // Critical for persistent connections!
+        stream.write_all(response_string.as_bytes()).await?;
+        stream.write_all(&self.body).await?;
+        stream.flush().await?; // Critical for persistent connections!
+
+        Ok(())
     }
 }
 
@@ -68,21 +75,27 @@ mod tests {
     use super::*;
     use crate::http::request::HttpMethod;
     use std::collections::HashMap;
-    use std::io::Read;
-    use std::net::{Shutdown, TcpListener, TcpStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
-    fn connected_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    async fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let client = TcpStream::connect(addr).unwrap();
-        let (server, _) = listener.accept().unwrap();
+        let client_fut = TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+
+        let (client_res, server_res) = tokio::join!(client_fut, accept_fut);
+
+        let client = client_res.unwrap();
+        let (server, _) = server_res.unwrap();
+
         (server, client)
     }
 
-    fn read_all(mut stream: TcpStream) -> Vec<u8> {
+    async fn read_all(mut stream: TcpStream) -> Vec<u8> {
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).unwrap();
+        stream.read_to_end(&mut buf).await.unwrap();
         buf
     }
 
@@ -129,17 +142,17 @@ mod tests {
         assert_eq!(resp.body, b"hello");
     }
 
-    #[test]
-    fn send_writes_status_headers_and_body() {
-        let (server, client) = connected_pair();
+    #[tokio::test]
+    async fn send_writes_status_headers_and_body() {
+        let (mut server, client) = connected_pair().await;
 
         let req = make_request(HashMap::new());
         let resp = HttpResponse::new("200 OK", "text/plain", b"hello".to_vec());
 
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_all(client);
+        let raw = read_all(client).await;
         let (headers, body) = split_headers_body(&raw);
         let headers_str = std::str::from_utf8(headers).unwrap();
 
@@ -155,9 +168,9 @@ mod tests {
         assert_eq!(body, b"hello");
     }
 
-    #[test]
-    fn send_adds_connection_close_if_requested() {
-        let (server, client) = connected_pair();
+    #[tokio::test]
+    async fn send_adds_connection_close_if_requested() {
+        let (mut server, client) = connected_pair().await;
 
         let mut headers = HashMap::new();
         headers.insert("connection".to_string(), "close".to_string());
@@ -165,10 +178,10 @@ mod tests {
         let req = make_request(headers);
         let resp = HttpResponse::new("200 OK", "text/plain", vec![]);
 
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_all(client);
+        let raw = read_all(client).await;
         let (headers, _body) = split_headers_body(&raw);
         let headers_str = std::str::from_utf8(headers).unwrap();
 
@@ -178,11 +191,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn send_gzips_body_when_accept_encoding_contains_gzip() {
+    #[tokio::test]
+    async fn send_gzips_body_when_accept_encoding_contains_gzip() {
         use flate2::read::GzDecoder;
+        use std::io::Read;
 
-        let (server, client) = connected_pair();
+        let (mut server, client) = connected_pair().await;
 
         let mut headers = HashMap::new();
         headers.insert("accept-encoding".to_string(), "gzip".to_string());
@@ -190,10 +204,10 @@ mod tests {
         let req = make_request(headers);
         let resp = HttpResponse::new("200 OK", "text/plain", b"hello gzip".to_vec());
 
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_all(client);
+        let raw = read_all(client).await;
         let (headers, body) = split_headers_body(&raw);
         let headers_str = std::str::from_utf8(headers).unwrap();
 
@@ -215,11 +229,12 @@ mod tests {
         assert_eq!(decompressed, b"hello gzip");
     }
 
-    #[test]
-    fn send_gzips_body_when_accept_encoding_is_a_list_containing_gzip() {
+    #[tokio::test]
+    async fn send_gzips_body_when_accept_encoding_is_a_list_containing_gzip() {
         use flate2::read::GzDecoder;
+        use std::io::Read;
 
-        let (server, client) = connected_pair();
+        let (mut server, client) = connected_pair().await;
 
         let mut headers = HashMap::new();
         headers.insert(
@@ -230,10 +245,10 @@ mod tests {
         let req = make_request(headers);
         let resp = HttpResponse::new("200 OK", "text/plain", b"abc123".to_vec());
 
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_all(client);
+        let raw = read_all(client).await;
         let (headers, body) = split_headers_body(&raw);
         let headers_str = std::str::from_utf8(headers).unwrap();
 
@@ -249,17 +264,17 @@ mod tests {
         assert_eq!(decompressed, b"abc123");
     }
 
-    #[test]
-    fn send_does_not_gzip_when_not_requested() {
-        let (server, client) = connected_pair();
+    #[tokio::test]
+    async fn send_does_not_gzip_when_not_requested() {
+        let (mut server, client) = connected_pair().await;
 
         let req = make_request(HashMap::new());
         let resp = HttpResponse::new("200 OK", "text/plain", b"plain body".to_vec());
 
-        resp.send(&server, &req);
-        server.shutdown(Shutdown::Write).unwrap();
+        resp.send(&mut server, &req).await.unwrap();
+        server.shutdown().await.unwrap();
 
-        let raw = read_all(client);
+        let raw = read_all(client).await;
         let (headers, body) = split_headers_body(&raw);
         let headers_str = std::str::from_utf8(headers).unwrap();
 
